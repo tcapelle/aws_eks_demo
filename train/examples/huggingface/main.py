@@ -91,7 +91,7 @@ def load_yaml_config():
 
 
 def run(args):
-    wandb_run = wandb.init(config=args)
+    wandb.init(config=args)
     args = wandb.config
 
     device_id = int(os.environ["LOCAL_RANK"])

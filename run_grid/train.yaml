@@ -32,14 +32,11 @@ spec:
             args:
             - "--nproc_per_node=2"
             - "/workspace/examples/huggingface/main.py"
+            - "--data=/shared-efs/wandb-finbert/"
             - "--epochs=1"
             - "--batch-size=16"
-                # number of data loader workers (NOT trainers)
-                # zero means load the data on the same process as the trainer
-                # this is set so that the container does not OOM since
-                # pytorch data loaders use shm
             - "--workers=6"
-            - "/shared-efs/wandb-finbert/"
+            - "--sweep_id=d7dtw20g"
             resources:
               limits:
                 nvidia.com/gpu: 2

@@ -169,7 +169,7 @@ def main():
     
     # Required paramaters
     parser.add_argument(
-        "data", 
+        "--data", 
         metavar="DIR", 
         help="path to dataset",
         required=True

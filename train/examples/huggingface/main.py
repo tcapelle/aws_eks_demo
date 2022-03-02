@@ -52,6 +52,7 @@ from contextlib import contextmanager
 from datetime import timedelta
 from typing import List, Tuple
 
+import wandb
 import numpy as np
 import torch
 import torch.backends.cudnn as cudnn
@@ -76,92 +77,25 @@ from torch.utils.data import DataLoader
 from collections import OrderedDict
 from sklearn.metrics import recall_score, accuracy_score, f1_score, precision_score
 
-parser = argparse.ArgumentParser(description="PyTorch Elastic HuggingFace Training")
+import yaml, wandb
+from ruamel.yaml import YAML
 
-parser.add_argument("data", metavar="DIR", help="path to dataset")
-
-parser.add_argument(
-    "-a",
-    "--arch",
-    metavar="ARCH",
-    default="HuggingFace",
-    #choices=model_names,
-    #help="model architecture: " + " | ".join(model_names) + " (default: resnet18)",
-)
-
-parser.add_argument(
-    "-j",
-    "--workers",
-    default=0,
-    type=int,
-    metavar="N",
-    help="number of data loading workers",
-)
-parser.add_argument(
-    "--epochs", default=30, type=int, metavar="N", help="number of total epochs to run"
-)
-
-parser.add_argument(
-    "-b",
-    "--batch-size",
-    default=32,
-    type=int,
-    metavar="N",
-    help="mini-batch size (default: 32), per worker (GPU)",
-)
-parser.add_argument(
-    "--lr",
-    "--learning-rate",
-    default=5e-5,
-    type=float,
-    metavar="LR",
-    help="initial learning rate",
-    dest="lr",
-)
-parser.add_argument("--momentum", default=0.9, type=float, metavar="M", help="momentum")
-parser.add_argument(
-    "--wd",
-    "--weight-decay",
-    default=1e-4,
-    type=float,
-    metavar="W",
-    help="weight decay (default: 1e-4)",
-    dest="weight_decay",
-)
-parser.add_argument(
-    "-p",
-    "--print-freq",
-    default=1,
-    type=int,
-    metavar="N",
-    help="print frequency (default: 10)",
-)
-parser.add_argument(
-    "--dist-backend",
-    default="nccl",
-    choices=["nccl", "gloo"],
-    type=str,
-    help="distributed backend",
-)
-parser.add_argument(
-    "--checkpoint-file",
-    default="/shared-efs/checkpoint.pth.tar",
-    type=str,
-    help="checkpoint file path, to load and save to",
-)
-parser.add_argument(
-    "--optimizer",
-    default="AdamW",
-    type=str,
-    help="optimizer type",
-)
+def load_yaml_config():
+    "Load config for training (params not touched by the sweep)"
+    yaml = YAML()
+    yaml.preserve_quotes = True    
+    # Read train template yaml
+    with open('./train_template.yaml') as file:
+        train_template = yaml.load(file)
 
 
-def main():
 
-    args = parser.parse_args()
+def run(args):
+    wandb_run = wandb.init(config=args)
+    args = wandb.config
+
     device_id = int(os.environ["LOCAL_RANK"])
-    
+        
     torch.cuda.set_device(device_id)
     print(f"=> set cuda device = {device_id}")
 
@@ -225,11 +159,47 @@ def main():
             # convergence_df.to_csv('/shared-efs/arxiv/convergence_df.csv')
 
     print('Training finished, took {:.2f}s'.format(time.time() - training_start_time))
-       
+    
     run_predictions(args.checkpoint_file, args.lr,args.optimizer)
-    
 
+    wandb.finish()
+
+def main():
+    parser = argparse.ArgumentParser(description="PyTorch Elastic HuggingFace Training")
     
+    # Required paramaters
+    parser.add_argument(
+        "data", 
+        metavar="DIR", 
+        help="path to dataset",
+        required=True
+    )
+    parser.add_argument(
+        "--sweep_id", 
+        default=None,
+        help="The Sweep id created by wandb",
+    )
+
+    # Other params
+    parser.add_argument("--arch", default="HuggingFace")
+    parser.add_argument("--workers", default=0, help="number of data loading workers")
+    parser.add_argument("--epochs", default=10, help="number of total epochs to run")
+    parser.add_argument("--batch-size", default=32, help="mini-batch size per worker (GPU)")
+    parser.add_argument("--lr", default=5e-5, help="initial learning rate")
+    parser.add_argument("--momentum", default=0.9, help="momentum")
+    parser.add_argument("--weight-decay", default=1e-4, help="weight decay (default: 1e-4)")
+    parser.add_argument("--print-freq", default=1, help="print frequency (default: 10)")
+    parser.add_argument("--dist-backend", default="nccl", choices=["nccl", "gloo"], help="distributed backend")
+    parser.add_argument("--checkpoint-file", default="/shared-efs/checkpoint.pth.tar", help="checkpoint file path, to load and save to")
+    parser.add_argument("--optimizer", default="AdamW", help="optimizer type")
+    args = parser.parse_args()
+
+    # config = load_yaml_config()
+
+    if args.sweep_id is not None:
+        wandb.agent(sweep_id, run(args), count=5)    
+    
+        
 
 class Dataset(torch.utils.data.Dataset):
     #'Characterizes a dataset for PyTorch'

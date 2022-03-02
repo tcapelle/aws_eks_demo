@@ -1,7 +1,7 @@
 method: bayes
 metric:
   goal: minimize
-  name: eval/loss
+  name: val_loss
 parameters:
   learning_rate:
     distribution: uniform

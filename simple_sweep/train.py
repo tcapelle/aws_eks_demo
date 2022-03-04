@@ -39,3 +39,33 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
+
+# def train(args=None):
+#     data = get_data(args.data_dir)
+
+#     with wandb.init(config=args):
+#         args = wandb.config
+#         train(args.param1, args.param2)
+
+# def main():
+#     parser = argparse.ArgumentParser(description="Simple Training")
+
+#     parser.add_argument("--data_dir", required=True)
+#     parser.add_argument("--sweep_id", default=None)
+#     parser.add_argument("--param1", default=1.)
+#     parser.add_argument("--param2", default=5)
+
+#     args = parser.parse_args()
+
+#     if args.sweep_id is not None:
+#         wandb.agent(args.sweep_id, run, project="simple_sweep")    
+#     else:
+#         run(args)
+
+# if __name__=="__main__":
+#     main()
+
+# python main.py --data_dir=/mnt/data_dir --sweep_id=asd0989q12

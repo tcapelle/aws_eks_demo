@@ -36,7 +36,8 @@ spec:
             - "--epochs=1"
             - "--batch-size=16"
             - "--workers=6"
-            - "--sweep_id=xvfz84df"
+            - "--wandb_project=aws_eks_elastic_demo"
+            - "--sweep_id=jdptk2zv"
             resources:
               limits:
                 nvidia.com/gpu: 2

@@ -121,15 +121,19 @@ def run(args):
         state.epoch = epoch
         train_loader.batch_sampler.sampler.set_epoch(epoch)
 
+        print(f"training epoch {epoch}")
         train_loss_epoch = train(train_loader, model, criterion, optimizer, epoch, device_id, print_freq)
+        
+        print(f"validating epoch {epoch}")
         val_loss_epoch = validate(val_loader, model, criterion, device_id, print_freq)
 
-
-        model_saver.save(state, val_loss_epoch)
-        
         if device_id == 0:
-            save_checkpoint(state, is_best, args.checkpoint_file)
+            model_saver.save(state, val_loss_epoch)
+        
+        # if device_id == 0:
+        #     save_checkpoint(state, is_best, args.checkpoint_file)
     
+    print(f"Running predictions")
     run_predictions(args.checkpoint_file, args.lr, args.optimizer)
 
     wandb.finish()
@@ -141,8 +145,8 @@ def main():
     parser.add_argument(
         "--data", 
         metavar="DIR", 
+        default="/shared-efs/wandb-finbert",
         help="path to dataset",
-        required=True
     )
     parser.add_argument(
         "--wandb_project", 
@@ -491,7 +495,7 @@ def validate(
     model.eval()
 
     with torch.inference_mode():
-        for (idx, batch) in enumerate(val_loader):
+        for (idx, batch) in tqdm(enumerate(val_loader), total=len(val_loader)):
         
             input_ids = batch['input_ids'].cuda(device_id, non_blocking=True)
             attention_mask = batch['attention_mask'].cuda(device_id, non_blocking=True)
@@ -506,7 +510,7 @@ def validate(
             losses.update(loss.item(),input_ids.size(0))
 
         wandb.log({"val_loss": losses.avg})
-        
+
     return losses.avg
 
 
@@ -591,7 +595,7 @@ def run_predictions(
     
     model = AutoModelForSequenceClassification.from_pretrained("bert-base-cased", num_labels=2)
     device = torch.device("cuda")
-    checkpoint = torch.load(checkpoint_dir+"/checkpoint.tar", map_location=str(device))
+    checkpoint = torch.load(checkpoint_dir+"/checkpoint.pth.tar", map_location=str(device))
     state_dict = checkpoint['state_dict']
     # create new OrderedDict that does not contain `module.`
 

@@ -40,9 +40,9 @@ def update_sweep_info(sweep_id, project):
 
 update_sweep_info(SWEEP_ID, WANDB_PROJECT_NAME)
 
-we probably don't need this anymore....
-cli_cmd = ['kubectl','apply','-f', TRAIN_CONFIG]
-logging.info(f"Running command: {cli_cmd}")
+# we probably don't need this anymore....
+# cli_cmd = ['kubectl','apply','-f', TRAIN_CONFIG]
+# logging.info(f"Running command: {cli_cmd}")
 
 
 # subprocess.run(cli_cmd)

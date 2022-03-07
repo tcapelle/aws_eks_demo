@@ -61,7 +61,7 @@ import torch.backends.cudnn as cudnn
 import torch.optim
 import torch.utils.data
 import torch.utils.data.distributed
-from torch.optim import SGD
+from torch.optim import SGD, AdamW
 from torch.optim.lr_scheduler import LinearLR
 
 os.environ["TOKENIZERS_PARALLELISM"] = "False"
@@ -71,7 +71,7 @@ from datasets import load_dataset, Features, ClassLabel, Value, load_metric
 from transformers import (
     AutoModelForSequenceClassification,
     AutoTokenizer,
-    AdamW,
+    LEDForConditionalGeneration
 )
 
 from torch.distributed.elastic.utils.data import ElasticDistributedSampler
@@ -87,15 +87,22 @@ from sklearn.metrics import recall_score, accuracy_score, f1_score, precision_sc
 
 logging.getLogger().setLevel(logging.INFO)
 
+# TODO: Refactor load/save with Huggingface from_pretrained/save_pretrained api.
+# Curently SGD and ADAMW produce problems with params (like momentum)
 
 def run(args):
-    wandb.init(config=args, project=args.wandb_project)
-    args = wandb.config
+    do_log = False
+    local_rank = int(os.environ["LOCAL_RANK"])
 
-    device_id = int(os.environ["LOCAL_RANK"])
+    if local_rank == 0:
+        wandb.init(config=args, project=args.wandb_project)
+        args = wandb.config
+        do_log = True
+    
+    device_id = local_rank
 
     torch.cuda.set_device(device_id)
-    logging.info(f"=> set cuda device = {device_id}")
+    logging.info(f"Set cuda device = {device_id}")
 
     dist.init_process_group(backend=args.dist_backend, init_method="env://", timeout=timedelta(seconds=120))
 
@@ -108,7 +115,7 @@ def run(args):
     # resume from checkpoint if one exists;
     state = load_checkpoint(args.checkpoint_file, device_id, args.arch, model, optimizer)
 
-    model_saver = SaveBestModel(args.checkpoint_file)
+    model_saver = SaveBestModel(args.checkpoint_file, do_log=do_log)
 
     # for most transformer based models Linear LR decays is best (1/10 total decay)
     scheduler = LinearLR(optimizer, start_factor=1., end_factor=0.1, total_iters=args.epochs)
@@ -122,11 +129,11 @@ def run(args):
         train_loader.batch_sampler.sampler.set_epoch(epoch)
 
         logging.info(f"training epoch {epoch}")
-        train_loss_epoch = train(train_loader, model, criterion, optimizer, epoch, device_id, print_freq)
+        train_loss_epoch = train(train_loader, model, criterion, optimizer, epoch, device_id, print_freq, do_log)
         scheduler.step()
 
         logging.info(f"validating epoch {epoch}")
-        val_loss_epoch = validate(val_loader, model, criterion, device_id, print_freq)
+        val_loss_epoch = validate(val_loader, model, criterion, device_id, print_freq, do_log)
 
         if device_id == 0:
             model_saver.save(state, val_loss_epoch)
@@ -135,7 +142,7 @@ def run(args):
         #     save_checkpoint(state, is_best, args.checkpoint_file)
 
     logging.info(f"Running predictions")
-    run_predictions(args.checkpoint_file, args.lr, args.optimizer)
+    run_predictions(args.checkpoint_file, args.lr, args.optimizer, do_log)
 
     wandb.finish()
 
@@ -407,9 +414,10 @@ def tmp_process_group(backend):
 class SaveBestModel:
     "A simple model saver Callback"
 
-    def __init__(self, filename, min_metric=True):
+    def __init__(self, filename, min_metric=True, do_log=True):
         self.filename = filename
         self.min_metric = min_metric
+        self.do_log = do_log
         self.checkpoint_dir = os.path.dirname(filename)
         os.makedirs(self.checkpoint_dir, exist_ok=True)
         self.best = 100 if min_metric else -1
@@ -424,7 +432,8 @@ class SaveBestModel:
     def _save(self):
         best_model = os.path.join(self.checkpoint_dir, "model_best.pth.tar")
         shutil.copyfile(self.filename, best_model)
-        self.log_model(best_model)
+        if self.do_log:
+             self.log_model(best_model)
 
     def log_model(self, path, metadata={}, description="trained model"):
         "Log model file"
@@ -464,6 +473,7 @@ def train(
     epoch: int,
     device_id: int,
     print_freq: int,
+    do_log: bool,
 ):
     losses = AverageMeter("Loss", ":.4e")
 
@@ -483,7 +493,8 @@ def train(
 
         # hf models return loss as 1st argument
         loss = outputs.loss
-        wandb.log({"train_loss": loss.item()})
+        if do_log:
+            wandb.log({"train_loss": loss.item()})
 
         # # measure accuracy and record loss
         losses.update(loss.item(), input_ids.size(0))
@@ -500,6 +511,7 @@ def validate(
     criterion,  # nn.CrossEntropyLoss
     device_id: int,
     print_freq: int,
+    do_log: bool,
 ):
     losses = AverageMeter("Loss", ":.4e")
 
@@ -533,8 +545,9 @@ def validate(
             for m in metrics:
                 m.update(pred_labels, true_labels)
 
-        wandb.log({"val_loss": losses.avg})
-        wandb.log({m.name:m.avg for m in metrics})
+        if do_log:
+            wandb.log({"val_loss": losses.avg})
+            wandb.log({m.name:m.avg for m in metrics})
 
     return losses.avg
 
@@ -593,7 +606,7 @@ class Metric(AverageMeter):
 #         return res
 
 
-def run_predictions(checkpoint_filename, lr, optimizer):
+def run_predictions(checkpoint_filename, lr, optimizer, do_log):
     print("**********************\nRunning predictions\n**********************")
     checkpoint_dir = os.path.dirname(checkpoint_filename)
     logging.info(checkpoint_dir)
@@ -652,7 +665,8 @@ def run_predictions(checkpoint_filename, lr, optimizer):
         "test_precision": precision,
     }
 
-    wandb.log(pred_dict)
+    if do_log:
+        wandb.log(pred_dict)
 
     metrics_df = pd.DataFrame()
     metrics_df = metrics_df.append(pred_dict, ignore_index=True)

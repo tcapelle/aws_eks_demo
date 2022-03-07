@@ -44,6 +44,9 @@ update_sweep_info(SWEEP_ID, WANDB_PROJECT_NAME)
 # cli_cmd = ['kubectl','apply','-f', TRAIN_CONFIG]
 # logging.info(f"Running command: {cli_cmd}")
 
+# TODO: Add the file yaml creation for spawning nodes.
+
+
 
 # subprocess.run(cli_cmd)
 # subprocess.run(cli_cmd)

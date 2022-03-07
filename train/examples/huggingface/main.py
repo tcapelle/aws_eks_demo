@@ -62,6 +62,7 @@ import torch.optim
 import torch.utils.data
 import torch.utils.data.distributed
 from torch.optim import SGD
+from torch.optim.lr_scheduler import LinearLR
 
 os.environ["TOKENIZERS_PARALLELISM"] = "False"
 
@@ -112,6 +113,9 @@ def run(args):
 
     model_saver = SaveBestModel(args.checkpoint_file)
 
+    # for most transformer based models Linear LR decays is best (1/10 total decay)
+    scheduler = LinearLR(optimizer, start_factor=1., end_factor=0.1, total_iters=args.epochs)
+
     start_epoch = state.epoch + 1
 
     print_freq = args.print_freq
@@ -122,6 +126,7 @@ def run(args):
 
         logging.info(f"training epoch {epoch}")
         train_loss_epoch = train(train_loader, model, criterion, optimizer, epoch, device_id, print_freq)
+        scheduler.step()
 
         logging.info(f"validating epoch {epoch}")
         val_loss_epoch = validate(val_loader, model, criterion, device_id, print_freq)
@@ -164,7 +169,7 @@ def main():
     parser.add_argument("--workers", default=0, type=int, help="number of data loading workers")
     parser.add_argument("--epochs", default=1, type=int, help="number of total epochs to run")
     parser.add_argument("--batch-size", default=32, type=int, help="mini-batch size per worker (GPU)")
-    parser.add_argument("--lr", default=5e-5, type=float, help="initial learning rate")
+    parser.add_argument("--lr", default=1e-4, type=float, help="initial learning rate")
     parser.add_argument("--momentum", default=0.9, help="momentum")
     parser.add_argument("--weight-decay", default=1e-4, help="weight decay (default: 1e-4)")
     parser.add_argument("--print-freq", default=1, type=int, help="print frequency (default: 10)")
@@ -480,7 +485,7 @@ def train(
         # print('Output done')
 
         # hf models return loss as 1st argument
-        loss = outputs[0]
+        loss = outputs.loss
         wandb.log({"train_loss": loss.item()})
 
         # # measure accuracy and record loss
@@ -501,11 +506,16 @@ def validate(
 ):
     losses = AverageMeter("Loss", ":.4e")
 
+    recall = AverageMeter("val_recall",":.4e")
+    f1 = AverageMeter("val_f1",":.4e")
+    accuracy = AverageMeter("val_accuracy",":.4e")
+    precision = AverageMeter("val_precision",":.4e")
+
     # switch to evaluate mode
     model.eval()
 
     with torch.inference_mode():
-        for (idx, batch) in tqdm(enumerate(val_loader), total=len(val_loader)):
+        for batch in tqdm(val_loader, total=len(val_loader)):
 
             input_ids = batch["input_ids"].cuda(device_id, non_blocking=True)
             attention_mask = batch["attention_mask"].cuda(device_id, non_blocking=True)
@@ -519,7 +529,20 @@ def validate(
             # # measure accuracy and record loss
             losses.update(loss.item(), input_ids.size(0))
 
-        wandb.log({"val_loss": losses.avg})
+            #compute metrics
+            pred_labels = outputs.logits.argmax(axis=1).tolist()
+            true_labels = list(labels)
+            
+            recall.update(recall_score(y_pred=pred_labels, y_true=true_labels))
+            f1.update(f1_score(y_pred=pred_labels, y_true=true_labels))
+            accuracy.update(accuracy_score(y_pred=pred_labels, y_true=true_labels))
+            precision.update(precision_score(y_pred=pred_labels, y_true=true_labels))
+
+        wandb.log({"val_loss": losses.avg,
+                   "val_accuracy":accuracy.avg,
+                   "val_recall": recall.avg,
+                   "val_f1": f1.avg,
+                   "val_precision": precision.avg})
 
     return losses.avg
 
@@ -599,9 +622,13 @@ def run_predictions(checkpoint_filename, lr, optimizer):
     checkpoint_dir = os.path.dirname(checkpoint_filename)
     logging.info(checkpoint_dir)
 
-    model = AutoModelForSequenceClassification.from_pretrained("bert-base-cased", num_labels=2)
     device = torch.device("cuda")
-    checkpoint = torch.load(checkpoint_dir + "/checkpoint.pth.tar", map_location=str(device))
+    model_name = "bert-base-cased"
+    test_file = "/shared-efs/wandb-finbert/test.csv"
+
+    model = AutoModelForSequenceClassification.from_pretrained(model_name, num_labels=2)
+    
+    checkpoint = torch.load(checkpoint_dir + "/checkpoint.pth.tar")
     state_dict = checkpoint["state_dict"]
     # create new OrderedDict that does not contain `module.`
 
@@ -613,12 +640,10 @@ def run_predictions(checkpoint_filename, lr, optimizer):
         new_state_dict[name] = v
     # load params
     model.load_state_dict(new_state_dict)
-    model.eval()
 
-    model_name = "bert-base-cased"
     tokenizer = AutoTokenizer.from_pretrained(model_name)
 
-    test_df = pd.read_csv("/shared-efs/wandb-finbert/test.csv")
+    test_df = pd.read_csv(test_file)
 
     logging.info("Tokening inputs")
     tokenized_test_inputs = tokenizer(
@@ -628,13 +653,15 @@ def run_predictions(checkpoint_filename, lr, optimizer):
         return_tensors="pt",
     )
 
-    # tokenized_test_inputs.to(device)
-    # model.to(device)
+    tokenized_test_inputs.to(device)
+    model.to(device)
+    logging.info("Running inference on: {device}")
 
+    model.eval()
     with torch.no_grad():
         preds = model(**tokenized_test_inputs)
 
-    pred_labels = preds[0].argmax(axis=1).tolist()
+    pred_labels = preds.logits.argmax(axis=1).tolist()
     true_labels = list(test_df["labels"])
 
     recall = recall_score(y_pred=pred_labels, y_true=true_labels)
@@ -643,13 +670,13 @@ def run_predictions(checkpoint_filename, lr, optimizer):
     precision = precision_score(y_pred=pred_labels, y_true=true_labels)
 
     pred_dict = {
-        "recall": recall,
-        "f1": f1,
-        "accuracy": accuracy,
-        "precision": precision,
+        "test_recall": recall,
+        "test_f1": f1,
+        "test_accuracy": accuracy,
+        "test_precision": precision,
     }
 
-    wandb.summary(pred_dict)
+    wandb.log(pred_dict)
 
     metrics_df = pd.DataFrame()
     metrics_df = metrics_df.append(pred_dict, ignore_index=True)

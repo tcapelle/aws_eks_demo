@@ -71,9 +71,6 @@ from datasets import load_dataset, Features, ClassLabel, Value, load_metric
 from transformers import (
     AutoModelForSequenceClassification,
     AutoTokenizer,
-    DataCollatorWithPadding,
-    Trainer,
-    TrainingArguments,
     AdamW,
 )
 
@@ -92,7 +89,7 @@ logging.getLogger().setLevel(logging.INFO)
 
 
 def run(args):
-    wandb.init(config=args)
+    wandb.init(config=args, project=args.wandb_project)
     args = wandb.config
 
     device_id = int(os.environ["LOCAL_RANK"])

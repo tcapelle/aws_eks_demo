@@ -506,10 +506,10 @@ def validate(
 ):
     losses = AverageMeter("Loss", ":.4e")
 
-    recall = AverageMeter("val_recall",":.4e")
-    f1 = AverageMeter("val_f1",":.4e")
-    accuracy = AverageMeter("val_accuracy",":.4e")
-    precision = AverageMeter("val_precision",":.4e")
+    metrics = [Metric("val_recall", recall_score), 
+               Metric("val_f1",f1_score),
+               Metric("val_accuracy", accuracy_score),
+               Metric("val_precision", precision_score)]
 
     # switch to evaluate mode
     model.eval()
@@ -530,19 +530,14 @@ def validate(
             losses.update(loss.item(), input_ids.size(0))
 
             #compute metrics
-            pred_labels = outputs.logits.argmax(axis=1).tolist()
-            true_labels = list(labels)
+            pred_labels = outputs.logits.argmax(axis=1).cpu()
+            true_labels = labels.cpu()
             
-            recall.update(recall_score(y_pred=pred_labels, y_true=true_labels))
-            f1.update(f1_score(y_pred=pred_labels, y_true=true_labels))
-            accuracy.update(accuracy_score(y_pred=pred_labels, y_true=true_labels))
-            precision.update(precision_score(y_pred=pred_labels, y_true=true_labels))
+            for m in metrics:
+                m.update(pred_labels, true_labels)
 
-        wandb.log({"val_loss": losses.avg,
-                   "val_accuracy":accuracy.avg,
-                   "val_recall": recall.avg,
-                   "val_f1": f1.avg,
-                   "val_precision": precision.avg})
+        wandb.log({"val_loss": losses.avg})
+        wandb.log({m.name:m.avg for m in metrics})
 
     return losses.avg
 
@@ -571,31 +566,15 @@ class AverageMeter(object):
         fmtstr = "{name} {val" + self.fmt + "} ({avg" + self.fmt + "})"
         return fmtstr.format(**self.__dict__)
 
+class Metric(AverageMeter):
 
-class ProgressMeter(object):
-    def __init__(self, num_batches: int, meters: List[AverageMeter], prefix: str = ""):
-        self.batch_fmtstr = self._get_batch_fmtstr(num_batches)
-        self.meters = meters
-        self.prefix = prefix
-
-    def display(self, batch: int) -> None:
-        entries = [self.prefix + self.batch_fmtstr.format(batch)]
-        entries += [str(meter) for meter in self.meters]
-        print("\t".join(entries))
-
-    def _get_batch_fmtstr(self, num_batches: int) -> str:
-        num_digits = len(str(num_batches // 1))
-        fmt = "{:" + str(num_digits) + "d}"
-        return "[" + fmt + "/" + fmt.format(num_batches) + "]"
-
-
-def adjust_learning_rate(optimizer, epoch: int, lr: float) -> None:
-    """
-    Sets the learning rate to the initial LR decayed by 10 every 30 epochs
-    """
-    learning_rate = lr * (0.1 ** (epoch // 30))
-    for param_group in optimizer.param_groups:
-        param_group["lr"] = learning_rate
+    def __init__(self, name, func):
+        super().__init__(name)
+        self.func = func
+    
+    def update(self, y_pred, y_true):
+        val = self.func(y_pred=y_pred, y_true=y_true)
+        super().update(val)
 
 
 # def accuracy(output, target, topk=(1,)):

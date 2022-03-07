@@ -43,16 +43,12 @@ Usage
         <DATA_DIR>
 """
 
-import argparse
-import io
-import os
-import shutil
-import time
+import argparse, io, os, shutil, time, logging, operator
+
 from contextlib import contextmanager
 from datetime import timedelta
 from typing import List, Tuple
 from pathlib import Path
-from functools import partial
 
 from tqdm import tqdm
 import wandb
@@ -71,7 +67,14 @@ os.environ["TOKENIZERS_PARALLELISM"] = "False"
 
 
 from datasets import load_dataset, Features, ClassLabel, Value, load_metric
-from transformers import AutoModelForSequenceClassification, AutoTokenizer, DataCollatorWithPadding, Trainer, TrainingArguments, AdamW
+from transformers import (
+    AutoModelForSequenceClassification,
+    AutoTokenizer,
+    DataCollatorWithPadding,
+    Trainer,
+    TrainingArguments,
+    AdamW,
+)
 
 from torch.distributed.elastic.utils.data import ElasticDistributedSampler
 
@@ -84,32 +87,28 @@ from torch.utils.data import DataLoader
 from collections import OrderedDict
 from sklearn.metrics import recall_score, accuracy_score, f1_score, precision_score
 
+logging.getLogger().setLevel(logging.INFO)
+
 
 def run(args):
     wandb.init(config=args)
     args = wandb.config
 
     device_id = int(os.environ["LOCAL_RANK"])
-        
-    torch.cuda.set_device(device_id)
-    print(f"=> set cuda device = {device_id}")
 
-    dist.init_process_group(
-        backend=args.dist_backend, init_method="env://", timeout=timedelta(seconds=120)
-    )
+    torch.cuda.set_device(device_id)
+    logging.info(f"=> set cuda device = {device_id}")
+
+    dist.init_process_group(backend=args.dist_backend, init_method="env://", timeout=timedelta(seconds=120))
 
     model, criterion, optimizer = initialize_huggingface_model(
         args.arch, args.lr, args.momentum, args.weight_decay, args.optimizer, device_id
     )
 
-    train_loader, val_loader = initialize_custom_data_loader(
-        args.data, args.batch_size, args.workers
-    )
-    
+    train_loader, val_loader = initialize_custom_data_loader(args.data, args.batch_size, args.workers)
+
     # resume from checkpoint if one exists;
-    state = load_checkpoint(
-        args.checkpoint_file, device_id, args.arch, model, optimizer
-    )
+    state = load_checkpoint(args.checkpoint_file, device_id, args.arch, model, optimizer)
 
     model_saver = SaveBestModel(args.checkpoint_file)
 
@@ -121,103 +120,116 @@ def run(args):
         state.epoch = epoch
         train_loader.batch_sampler.sampler.set_epoch(epoch)
 
-        print(f"training epoch {epoch}")
+        logging.info(f"training epoch {epoch}")
         train_loss_epoch = train(train_loader, model, criterion, optimizer, epoch, device_id, print_freq)
-        
-        print(f"validating epoch {epoch}")
+
+        logging.info(f"validating epoch {epoch}")
         val_loss_epoch = validate(val_loader, model, criterion, device_id, print_freq)
 
         if device_id == 0:
             model_saver.save(state, val_loss_epoch)
-        
+
         # if device_id == 0:
         #     save_checkpoint(state, is_best, args.checkpoint_file)
-    
-    print(f"Running predictions")
+
+    logging.info(f"Running predictions")
     run_predictions(args.checkpoint_file, args.lr, args.optimizer)
 
     wandb.finish()
 
+
 def main():
     parser = argparse.ArgumentParser(description="PyTorch Elastic HuggingFace Training")
-    
+
     # Required paramaters
     parser.add_argument(
-        "--data", 
-        metavar="DIR", 
+        "--data",
+        metavar="DIR",
         default="/shared-efs/wandb-finbert",
         help="path to dataset",
     )
     parser.add_argument(
-        "--wandb_project", 
+        "--wandb_project",
         default="aws_eks_elastic_demo",
         help="The wandb project name",
     )
     parser.add_argument(
-        "--sweep_id", 
+        "--sweep_id",
         default=None,
         help="The Sweep id created by wandb",
     )
 
     # Other params
     parser.add_argument("--arch", default="HuggingFace")
-    parser.add_argument("--workers", default=0, help="number of data loading workers")
-    parser.add_argument("--epochs", default=1, help="number of total epochs to run")
-    parser.add_argument("--batch-size", default=32, help="mini-batch size per worker (GPU)")
-    parser.add_argument("--lr", default=5e-5, help="initial learning rate")
+    parser.add_argument("--workers", default=0, type=int, help="number of data loading workers")
+    parser.add_argument("--epochs", default=1, type=int, help="number of total epochs to run")
+    parser.add_argument("--batch-size", default=32, type=int, help="mini-batch size per worker (GPU)")
+    parser.add_argument("--lr", default=5e-5, type=float, help="initial learning rate")
     parser.add_argument("--momentum", default=0.9, help="momentum")
     parser.add_argument("--weight-decay", default=1e-4, help="weight decay (default: 1e-4)")
-    parser.add_argument("--print-freq", default=1, help="print frequency (default: 10)")
-    parser.add_argument("--dist-backend", default="nccl", choices=["nccl", "gloo"], help="distributed backend")
-    parser.add_argument("--checkpoint-file", default="/shared-efs/checkpoint.pth.tar", help="checkpoint file path, to load and save to")
+    parser.add_argument("--print-freq", default=1, type=int, help="print frequency (default: 10)")
+    parser.add_argument(
+        "--dist-backend",
+        default="nccl",
+        choices=["nccl", "gloo"],
+        help="distributed backend",
+    )
+    parser.add_argument(
+        "--checkpoint-file",
+        default="/shared-efs/checkpoint.pth.tar",
+        help="checkpoint file path, to load and save to",
+    )
     parser.add_argument("--optimizer", default="AdamW", help="optimizer type")
-   
+
     args = parser.parse_args()
 
     if args.sweep_id is not None:
-        wandb.agent(args.sweep_id, lambda: run(args), project=args.wandb_project)    
+        wandb.agent(args.sweep_id, lambda: run(args), project=args.wandb_project)
     else:
         run(args=args)
-  
+
 
 class Dataset(torch.utils.data.Dataset):
     #'Characterizes a dataset for PyTorch'
-    def __init__(self, data_dir, file_name ):
-    
+    def __init__(self, data_dir, file_name):
+
         #'Initialization'
         self.data_dir = data_dir
-        self.df = pd.read_csv(Path(data_dir)/file_name)
-        
+        self.df = pd.read_csv(Path(data_dir) / file_name)
+
     def __len__(self):
         # 'Denotes the total number of samples'
         return len(self.df)
-        
+
     def __getitem__(self, index):
         #'Generates one sample of data'
         # Select sample
         df = self.df
-        one_line = df['Text'][index]
-        label = df['labels'][index]
-        
-        return (one_line,label)
+        one_line = df["Text"][index]
+        label = df["labels"][index]
 
-def collate_tokenize(data,tokenizer):
+        return (one_line, label)
+
+
+def collate_tokenize(data, tokenizer):
     text_batch = [element[0] for element in data]
     labels = [element[1] for element in data]
-    tokenized_inputs = tokenizer(text_batch, padding='max_length', truncation=True, return_tensors='pt')
-    
-    tokenized_inputs['labels'] = torch.tensor(labels)
-    tokenized_inputs['attention_mask'] = tokenized_inputs['attention_mask']
+    tokenized_inputs = tokenizer(text_batch, padding="max_length", truncation=True, return_tensors="pt")
+
+    tokenized_inputs["labels"] = torch.tensor(labels)
+    tokenized_inputs["attention_mask"] = tokenized_inputs["attention_mask"]
 
     return tokenized_inputs
-    
+
+
 class MyCollator(object):
-    def __init__(self,tokenizer):
+    def __init__(self, tokenizer):
         self.tokenizer = tokenizer
+
     def __call__(self, batch):
         # do something with batch and self.params
-        tokenized_inputs = collate_tokenize(batch,self.tokenizer)
-        
+        tokenized_inputs = collate_tokenize(batch, self.tokenizer)
+
         return tokenized_inputs
 
 
@@ -274,79 +286,80 @@ class State:
 
 
 def initialize_huggingface_model(
-    arch: str, lr: float, momentum: float, weight_decay: float, optimizer_type, device_id: int
+    arch: str,
+    lr: float,
+    momentum: float,
+    weight_decay: float,
+    optimizer_type,
+    device_id: int,
 ):
-    print(f"=> creating model: {arch}")
-    
+    logging.info(f"=> creating model: {arch}")
+
     ## Initializing the model
     model = AutoModelForSequenceClassification.from_pretrained("bert-base-cased", num_labels=2)
-    
+
     # For multiprocessing distributed, DistributedDataParallel constructor
     # should always set the single device scope, otherwise,
     # DistributedDataParallel will use all available devices.
-    
+
     model.cuda(device_id)
-    
+
     cudnn.benchmark = True
-    
+
     model = DistributedDataParallel(model, device_ids=[device_id])
-    
+
     # define loss function (criterion) and optimizer
     criterion = nn.CrossEntropyLoss().cuda(device_id)
 
     # initialize optimizer
-    if optimizer_type == 'AdamW':
+    if optimizer_type == "AdamW":
         optimizer = AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
-    if optimizer_type == 'SGD':
+    if optimizer_type == "SGD":
         optimizer = SGD(model.parameters(), lr=lr, momentum=momentum, weight_decay=weight_decay)
 
     return model, criterion, optimizer
 
 
-def initialize_custom_data_loader(
-    data_dir, batch_size, num_data_workers
-) -> Tuple[DataLoader, DataLoader]:
-    
+def initialize_custom_data_loader(data_dir, batch_size, num_data_workers) -> Tuple[DataLoader, DataLoader]:
+
     # Generators
-    train_dataset = Dataset(data_dir, file_name = 'train.csv')
-    print('Train dataset done')
+    train_dataset = Dataset(data_dir, file_name="train.csv")
+    logging.info("Train dataset done")
 
     train_sampler = ElasticDistributedSampler(train_dataset)
-    print('Train sampler done')
-    
+    logging.info("Train sampler done")
+
     model_name = "bert-base-cased"
     tokenizer = AutoTokenizer.from_pretrained(model_name)
 
-    
     my_collator = MyCollator(tokenizer)
-    
+
     train_loader = DataLoader(
-            train_dataset,
-            batch_size=batch_size,
-            num_workers=num_data_workers,
-            pin_memory=True,
-            collate_fn=my_collator,
-            sampler=train_sampler
-        )
-        
-    print('Train loader done')
-    
-    test_dataset = Dataset(data_dir, file_name = 'test.csv')
-    
-    print('Test dataset done')
+        train_dataset,
+        batch_size=batch_size,
+        num_workers=num_data_workers,
+        pin_memory=True,
+        collate_fn=my_collator,
+        sampler=train_sampler,
+    )
+
+    logging.info("Train loader done")
+
+    test_dataset = Dataset(data_dir, file_name="test.csv")
+
+    logging.info("Test dataset done")
 
     test_loader = DataLoader(
         test_dataset,
         batch_size=batch_size,
         num_workers=num_data_workers,
         pin_memory=True,
-        collate_fn=my_collator
+        collate_fn=my_collator,
     )
-    
-    print('Test loader done')
-    
+
+    logging.info("Test loader done")
+
     return train_loader, test_loader
-    
 
 
 def load_checkpoint(
@@ -372,11 +385,11 @@ def load_checkpoint(
     state = State(arch, model, optimizer)
 
     if os.path.isfile(checkpoint_file):
-        print(f"=> loading checkpoint file: {checkpoint_file}")
+        logging.info(f"=> loading checkpoint file: {checkpoint_file}")
         state.load(checkpoint_file, device_id)
-        print(f"=> loaded checkpoint file: {checkpoint_file}")
+        logging.info(f"=> loaded checkpoint file: {checkpoint_file}")
 
-    print(f"=> done restoring from previous checkpoint")
+    logging.info(f"=> done restoring from previous checkpoint")
     return state
 
 
@@ -388,8 +401,10 @@ def tmp_process_group(backend):
     finally:
         dist.destroy_process_group(cpu_pg)
 
+
 class SaveBestModel:
     "A simple model saver Callback"
+
     def __init__(self, filename, min_metric=True):
         self.filename = filename
         self.min_metric = min_metric
@@ -399,27 +414,26 @@ class SaveBestModel:
 
     def save(self, state, metric_value):
         torch.save(state.capture_snapshot(), self.filename)
-        if (self.min_metric and (metric_value < self.best)) or \
-           ((not self.min_metric) and (metric_value > self.best)):
-            print(f"=> best model found at epoch {state.epoch}")
+        op = operator.lt if self.min_metric else operator.gt
+        if op(metric_value, self.best):
+            logging.info(f"=> best model found at epoch {state.epoch}")
             self._save()
-            
+
     def _save(self):
         best_model = os.path.join(self.checkpoint_dir, "model_best.pth.tar")
         shutil.copyfile(self.filename, best_model)
         self.log_model(best_model)
 
-
-    def log_model(self, path, metadata={}, description='trained model'):
+    def log_model(self, path, metadata={}, description="trained model"):
         "Log model file"
         if wandb.run is None:
-            raise ValueError('You must call wandb.init() before log_model()')
+            raise ValueError("You must call wandb.init() before log_model()")
         path = Path(path)
         if not path.is_file():
-            raise f'path must be a valid file: {path}'
-        name = f'run-{wandb.run.id}-model'
-        artifact_model = wandb.Artifact(name=name, type='model', metadata=metadata, description=description)
-        with artifact_model.new_file(name, mode='wb') as fa:
+            raise f"path must be a valid file: {path}"
+        name = f"run-{wandb.run.id}-model"
+        artifact_model = wandb.Artifact(name=name, type="model", metadata=metadata, description=description)
+        with artifact_model.new_file(name, mode="wb") as fa:
             fa.write(path.read_bytes())
         wandb.run.log_artifact(artifact_model)
 
@@ -447,39 +461,35 @@ def train(
     optimizer,  # AdamW,
     epoch: int,
     device_id: int,
-    print_freq: int
+    print_freq: int,
 ):
     losses = AverageMeter("Loss", ":.4e")
 
-
-    
     model.train()
 
     for (idx, batch) in tqdm(enumerate(train_loader), total=len(train_loader)):
 
         optimizer.zero_grad()
-        input_ids = batch['input_ids'].cuda(device_id, non_blocking=True)
-        attention_mask = batch['attention_mask'].cuda(device_id, non_blocking=True)
-        labels = batch['labels'].cuda(device_id, non_blocking=True)
-        
+        input_ids = batch["input_ids"].cuda(device_id, non_blocking=True)
+        attention_mask = batch["attention_mask"].cuda(device_id, non_blocking=True)
+        labels = batch["labels"].cuda(device_id, non_blocking=True)
+
         # forward pass
         outputs = model(input_ids, attention_mask=attention_mask, labels=labels)
-        
-        #print('Output done')
-        
+
+        # print('Output done')
+
         # hf models return loss as 1st argument
         loss = outputs[0]
         wandb.log({"train_loss": loss.item()})
 
         # # measure accuracy and record loss
         losses.update(loss.item(), input_ids.size(0))
-        
+
         loss.backward()
         optimizer.step()
 
     return losses.avg
-
-        
 
 
 def validate(
@@ -496,18 +506,18 @@ def validate(
 
     with torch.inference_mode():
         for (idx, batch) in tqdm(enumerate(val_loader), total=len(val_loader)):
-        
-            input_ids = batch['input_ids'].cuda(device_id, non_blocking=True)
-            attention_mask = batch['attention_mask'].cuda(device_id, non_blocking=True)
-            labels = batch['labels'].cuda(device_id, non_blocking=True)
-            
-            outputs = model(input_ids, attention_mask=attention_mask, labels = labels)
+
+            input_ids = batch["input_ids"].cuda(device_id, non_blocking=True)
+            attention_mask = batch["attention_mask"].cuda(device_id, non_blocking=True)
+            labels = batch["labels"].cuda(device_id, non_blocking=True)
+
+            outputs = model(input_ids, attention_mask=attention_mask, labels=labels)
 
             # compute output
             loss = outputs[0]
 
             # # measure accuracy and record loss
-            losses.update(loss.item(),input_ids.size(0))
+            losses.update(loss.item(), input_ids.size(0))
 
         wandb.log({"val_loss": losses.avg})
 
@@ -583,71 +593,80 @@ def adjust_learning_rate(optimizer, epoch: int, lr: float) -> None:
 #             res.append(correct_k.mul_(100.0 / batch_size))
 #         return res
 
-def run_predictions(
-    checkpoint_filename,
-    lr,
-    optimizer
-):
-    
+
+def run_predictions(checkpoint_filename, lr, optimizer):
+    print("**********************\nRunning predictions\n**********************")
     checkpoint_dir = os.path.dirname(checkpoint_filename)
-    print('*****************')
-    print(checkpoint_dir)
-    
+    logging.info(checkpoint_dir)
+
     model = AutoModelForSequenceClassification.from_pretrained("bert-base-cased", num_labels=2)
     device = torch.device("cuda")
-    checkpoint = torch.load(checkpoint_dir+"/checkpoint.pth.tar", map_location=str(device))
-    state_dict = checkpoint['state_dict']
+    checkpoint = torch.load(checkpoint_dir + "/checkpoint.pth.tar", map_location=str(device))
+    state_dict = checkpoint["state_dict"]
     # create new OrderedDict that does not contain `module.`
 
+    logging.info("Doing some state dict magic")
     new_state_dict = OrderedDict()
     for k, v in state_dict.items():
-        #name = k[7:] # remove `module.`
-        name = k.replace('module.', '') # removing ‘moldule.’ from key
+        # name = k[7:] # remove `module.`
+        name = k.replace("module.", "")  # removing ‘moldule.’ from key
         new_state_dict[name] = v
     # load params
     model.load_state_dict(new_state_dict)
     model.eval()
-    
+
     model_name = "bert-base-cased"
     tokenizer = AutoTokenizer.from_pretrained(model_name)
-    
-    test_df = pd.read_csv('/shared-efs/wandb-finbert/test.csv')
-    
-    tokenized_test_inputs = tokenizer(list(test_df['Text']), padding='max_length', truncation=True, return_tensors='pt')
-    
+
+    test_df = pd.read_csv("/shared-efs/wandb-finbert/test.csv")
+
+    logging.info("Tokening inputs")
+    tokenized_test_inputs = tokenizer(
+        list(test_df["Text"]),
+        padding="max_length",
+        truncation=True,
+        return_tensors="pt",
+    )
+
     # tokenized_test_inputs.to(device)
     # model.to(device)
-    
+
     with torch.no_grad():
         preds = model(**tokenized_test_inputs)
-        
-    pred_labels = preds[0].argmax(axis = 1).tolist()
-    true_labels = list(test_df['labels'])
-    
-    recall = recall_score(y_pred=pred_labels,y_true = true_labels)
-    f1 = f1_score(y_pred=pred_labels,y_true = true_labels)
-    accuracy = accuracy_score(y_pred=pred_labels,y_true = true_labels)
-    precision = precision_score(y_pred=pred_labels,y_true = true_labels)
-    
-    pred_dict = {'recall': recall,
-    'f1': f1,
-    'accuracy': accuracy,
-    'precision': precision}
-    
+
+    pred_labels = preds[0].argmax(axis=1).tolist()
+    true_labels = list(test_df["labels"])
+
+    recall = recall_score(y_pred=pred_labels, y_true=true_labels)
+    f1 = f1_score(y_pred=pred_labels, y_true=true_labels)
+    accuracy = accuracy_score(y_pred=pred_labels, y_true=true_labels)
+    precision = precision_score(y_pred=pred_labels, y_true=true_labels)
+
+    pred_dict = {
+        "recall": recall,
+        "f1": f1,
+        "accuracy": accuracy,
+        "precision": precision,
+    }
+
+    wandb.summary(pred_dict)
+
     metrics_df = pd.DataFrame()
     metrics_df = metrics_df.append(pred_dict, ignore_index=True)
-    
-    run_name = checkpoint_dir.split('/')[-1]
-    metrics_df['run_name'] = run_name
-    metrics_df['lr'] = lr
-    metrics_df['optimizer'] = optimizer
-    
-    
-    if os.path.exists('/shared-efs/wandb-finbert/all_results.csv'):
-        metrics_df.to_csv('/shared-efs/wandb-finbert/all_results.csv', mode='a', index=False, header=False)
+
+    run_name = checkpoint_dir.split("/")[-1]
+    metrics_df["run_name"] = run_name
+    metrics_df["lr"] = lr
+    metrics_df["optimizer"] = optimizer
+
+    out_file = "all_results.csv"
+
+    logging.info(f"Logging metrics to : {out_file}")
+    if os.path.exists(f"/shared-efs/wandb-finbert/{out_file}"):
+        metrics_df.to_csv(f"/shared-efs/wandb-finbert/{out_file}", mode="a", index=False, header=False)
     else:
-        metrics_df.to_csv('/shared-efs/wandb-finbert/all_results.csv', index=False)
-    
+        metrics_df.to_csv(f"/shared-efs/wandb-finbert/{out_file}", index=False)
+
     return None
 
 

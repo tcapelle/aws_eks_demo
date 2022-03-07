@@ -64,8 +64,7 @@ import torch.utils.data.distributed
 from torch.optim import SGD, AdamW
 from torch.optim.lr_scheduler import LinearLR
 
-os.environ["TOKENIZERS_PARALLELISM"] = "False"
-
+os.environ["WANDB_START_METHOD"] = "thread"
 
 from datasets import load_dataset, Features, ClassLabel, Value, load_metric
 from transformers import (
@@ -91,13 +90,16 @@ logging.getLogger().setLevel(logging.INFO)
 # Curently SGD and ADAMW produce problems with params (like momentum)
 
 def run(args):
-    do_log = False
+
     local_rank = int(os.environ["LOCAL_RANK"])
 
     if local_rank == 0:
         wandb.init(config=args, project=args.wandb_project)
         args = wandb.config
         do_log = True
+    else:
+        
+        do_log = False
     
     device_id = local_rank
 
@@ -120,11 +122,11 @@ def run(args):
     # for most transformer based models Linear LR decays is best (1/10 total decay)
     scheduler = LinearLR(optimizer, start_factor=1., end_factor=0.1, total_iters=args.epochs)
 
-    start_epoch = state.epoch + 1
+    # start_epoch = state.epoch + 1
 
     print_freq = args.print_freq
 
-    for epoch in range(start_epoch, args.epochs):
+    for epoch in range(args.epochs):
         state.epoch = epoch
         train_loader.batch_sampler.sampler.set_epoch(epoch)
 
@@ -191,6 +193,9 @@ def main():
     parser.add_argument("--optimizer", default="AdamW", help="optimizer type")
 
     args = parser.parse_args()
+
+    wandb.require("service")
+    wandb.setup()
 
     if args.sweep_id is not None:
         wandb.agent(args.sweep_id, lambda: run(args), project=args.wandb_project)
@@ -479,7 +484,7 @@ def train(
 
     model.train()
 
-    for (idx, batch) in tqdm(enumerate(train_loader), total=len(train_loader)):
+    for batch in tqdm(train_loader, total=len(train_loader)):
 
         optimizer.zero_grad()
         input_ids = batch["input_ids"].cuda(device_id, non_blocking=True)
@@ -488,8 +493,6 @@ def train(
 
         # forward pass
         outputs = model(input_ids, attention_mask=attention_mask, labels=labels)
-
-        # print('Output done')
 
         # hf models return loss as 1st argument
         loss = outputs.loss

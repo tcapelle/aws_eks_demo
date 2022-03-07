@@ -16,7 +16,7 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 #GLOBALS
 TRAIN_CONFIG = './train.yaml'
 SWEEP_CONFIG = './sweep_config.yaml'
-WANDB_PROJECT_NAME = "aws_eks_elastic_demo"
+WANDB_PROJECT_NAME = "aws_eks_demo"
 SWEEP_ID = ""
 
 

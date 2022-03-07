@@ -152,7 +152,7 @@ def main():
     )
     parser.add_argument(
         "--wandb_project",
-        default="aws_eks_elastic_demo",
+        default="aws_eks_demo",
         help="The wandb project name",
     )
     parser.add_argument(
@@ -631,7 +631,7 @@ def run_predictions(checkpoint_filename, lr, optimizer):
 
     tokenized_test_inputs.to(device)
     model.to(device)
-    logging.info("Running inference on: {device}")
+    logging.info(f"Running inference on: {device}")
 
     model.eval()
     with torch.no_grad():

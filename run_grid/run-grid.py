@@ -1,87 +1,55 @@
-import yaml
-import ruamel.yaml
+from json import load
+import os, subprocess, logging, yaml
+
+from ruamel.yaml import YAML
 from ruamel.yaml.scalarstring import DoubleQuotedScalarString as dq
 
-import math
 import wandb
 
-import os
-import numpy as np
-import subprocess
-import random
+ryaml = YAML()
+ryaml.preserve_quotes = True
 
-os.environ['WANDB_API_KEY'] = '04c9d9c5108b0fb2417ad89135de4c01be189f32'
-wandb.login()
+logging.getLogger().setLevel(logging.INFO)
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-# Run deploy.sh
+#GLOBALS
+TRAIN_CONFIG = './train.yaml'
+SWEEP_CONFIG = './sweep_config.yaml'
+WANDB_PROJECT_NAME = "aws_eks_demo"
+SWEEP_ID = ""
 
 
-with open('./sweep_config.yaml') as file:
+with open(SWEEP_CONFIG) as file:
     sweep_config = yaml.full_load(file)
-    
-sweep_id = wandb.sweep(sweep_config, project="aws_eks_elastic_demo")
 
-def train_sweep(config=None):
-    # Initialize a new wandb run
-    with wandb.init(config=config):
-        # If called by wandb.agent, as below,
-        # this config will be set by Sweep Controller
-        config = wandb.config
-        
-        yaml = ruamel.yaml.YAML()
-        yaml.preserve_quotes = True    
-        # Read train template yaml
-        with open('./train_template.yaml') as file:
-            train_template = yaml.load(file)
-            
-        job_name = 'wandb-finbert'    
-        instance_type = 'p3.8xlarge'
-        docker_image = '999701187340.dkr.ecr.us-west-2.amazonaws.com/torchelastic-huggingface'
-        path_to_training_code_in_container = "/workspace/examples/huggingface/main.py"
-        dataset_path = '/shared-efs/wandb-finbert/'
-    
-        
-        # Edit train-template to generate train yaml for one run
-        hash_str = ''.join(random.choice('abcdefghijklmnopqrstuvwxyz') for i in range(5))
-        
-        directory_name = '/shared-efs/wandb-finbert/run-'+hash_str
-        if not os.path.isdir("directory_name"):
-            os.mkdir("directory_name")
-        
-        train_template["metadata"]["name"] = job_name + '-' + hash_str
-        train_template["spec"]["replicaSpecs"]["Worker"]["replicas"] = 1
-        # train_template["spec"]["replicaSpecs"]["Worker"]["template"]["spec"]["nodeSelector"]["beta.kubernetes.io/instance-type"] = instance_type
-        # train_template["spec"]["replicaSpecs"]["Worker"]["template"]["spec"]["containers"][0]['image'] = docker_image
-        
-        # Training Args
-        train_template["spec"]["replicaSpecs"]["Worker"]["template"]["spec"]["containers"][0]['args'][0] = dq('--nproc_per_node=2')
-        train_template["spec"]["replicaSpecs"]["Worker"]["template"]["spec"]["containers"][0]['args'][1] = dq(path_to_training_code_in_container)
-        train_template["spec"]["replicaSpecs"]["Worker"]["template"]["spec"]["containers"][0]['args'][2] = dq('--epochs=1')
-        train_template["spec"]["replicaSpecs"]["Worker"]["template"]["spec"]["containers"][0]['args'][3] = dq('--batch-size=16')
-        train_template["spec"]["replicaSpecs"]["Worker"]["template"]["spec"]["containers"][0]['args'][4] = dq('--workers=6')
-        train_template["spec"]["replicaSpecs"]["Worker"]["template"]["spec"]["containers"][0]['args'][5] = dq('--checkpoint-file='+directory_name+'/checkpoint.tar')
-        train_template["spec"]["replicaSpecs"]["Worker"]["template"]["spec"]["containers"][0]['args'][6] = dq(dataset_path)
-        
-        train_template["spec"]["replicaSpecs"]["Worker"]["template"]["spec"]["containers"][0]['args'][7] = dq('--learning-rate='+str(config.learning_rate))
-        train_template["spec"]["replicaSpecs"]["Worker"]["template"]["spec"]["containers"][0]['args'][8] = dq('--optimizer='+config.optimizer)
-        
-        train_template["spec"]["replicaSpecs"]["Worker"]["template"]["spec"]["containers"][0]["resources"]["limits"]["nvidia.com/gpu"] = 2
-        
-        train_yaml_filename = './train-yamls/train-'+hash_str+'.yaml'
-        with open(train_yaml_filename, 'w') as file:
-            train_template = yaml.dump(train_template, file)
-            
-        cli_cmd = ['kubectl','apply','-f',train_yaml_filename]
-        print(cli_cmd)
-        
-        subprocess.run(cli_cmd)
-        
-    return None
-    
-cli_cmd = ['kubectl','apply','-f','train-baseline.yaml']
-subprocess.run(cli_cmd)
+with open(TRAIN_CONFIG) as file:
+    train_config = ryaml.load(file)
 
-wandb.agent(sweep_id, train_sweep, count=5)
+#create sweep controller
+SWEEP_ID = wandb.sweep(sweep_config, project=WANDB_PROJECT_NAME)
+logging.info(f"Creating Sweep: {SWEEP_ID}")
 
+# let's write the sweep_id on the file as arg for the main script
+def update_sweep_info(sweep_id, project):
+    "Inject wandb info in train yaml"
+    train_config["spec"]["replicaSpecs"]["Worker"]["template"]["spec"]["containers"][0]['args'][6] = dq(f'--wandb_project={project}')
+    train_config["spec"]["replicaSpecs"]["Worker"]["template"]["spec"]["containers"][0]['args'][7] = dq(f'--sweep_id={sweep_id}')
+    with open(TRAIN_CONFIG, 'w') as file:
+        ryaml.dump(train_config, file)
+
+update_sweep_info(SWEEP_ID, WANDB_PROJECT_NAME)
+
+# we probably don't need this anymore....
+# cli_cmd = ['kubectl','apply','-f', TRAIN_CONFIG]
+# logging.info(f"Running command: {cli_cmd}")
+
+# TODO: Add the file yaml creation for spawning nodes.
+
+
+
+# subprocess.run(cli_cmd)
+# subprocess.run(cli_cmd)
+# subprocess.run(cli_cmd)
+# subprocess.run(cli_cmd)
+# subprocess.run(cli_cmd)

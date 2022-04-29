@@ -43,232 +43,207 @@ Usage
         <DATA_DIR>
 """
 
-import argparse
-import io
-import os
-import shutil
-import time
+import argparse, io, os, shutil, time, logging, operator
+
 from contextlib import contextmanager
 from datetime import timedelta
 from typing import List, Tuple
+from pathlib import Path
 
-import numpy as np
+from tqdm import tqdm
+import wandb
+
 import torch
-import torch.backends.cudnn as cudnn
 import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.parallel
+import torch.backends.cudnn as cudnn
 import torch.optim
 import torch.utils.data
 import torch.utils.data.distributed
-from torch.optim import SGD
+from torch.optim import SGD, AdamW
+from torch.optim.lr_scheduler import LinearLR
+
+os.environ["WANDB_START_METHOD"] = "thread"
 
 from datasets import load_dataset, Features, ClassLabel, Value, load_metric
-from transformers import AutoModelForSequenceClassification, AutoTokenizer, DataCollatorWithPadding, Trainer, TrainingArguments, AdamW
+from transformers import (
+    AutoModelForSequenceClassification,
+    AutoTokenizer,
+    LEDForConditionalGeneration
+)
+
+from torch.distributed.elastic.utils.data import ElasticDistributedSampler
 
 from pathlib import Path
 import pandas as pd
 
-from torch.distributed.elastic.utils.data import ElasticDistributedSampler
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader
 
 from collections import OrderedDict
 from sklearn.metrics import recall_score, accuracy_score, f1_score, precision_score
 
-parser = argparse.ArgumentParser(description="PyTorch Elastic HuggingFace Training")
+logging.getLogger().setLevel(logging.INFO)
 
-parser.add_argument("data", metavar="DIR", help="path to dataset")
+# TODO: Refactor load/save with Huggingface from_pretrained/save_pretrained api.
+# Curently SGD and ADAMW produce problems with params (like momentum)
 
-parser.add_argument(
-    "-a",
-    "--arch",
-    metavar="ARCH",
-    default="HuggingFace",
-    #choices=model_names,
-    #help="model architecture: " + " | ".join(model_names) + " (default: resnet18)",
-)
+def run(args):
 
-parser.add_argument(
-    "-j",
-    "--workers",
-    default=0,
-    type=int,
-    metavar="N",
-    help="number of data loading workers",
-)
-parser.add_argument(
-    "--epochs", default=30, type=int, metavar="N", help="number of total epochs to run"
-)
+    local_rank = int(os.environ["LOCAL_RANK"])
 
-parser.add_argument(
-    "-b",
-    "--batch-size",
-    default=32,
-    type=int,
-    metavar="N",
-    help="mini-batch size (default: 32), per worker (GPU)",
-)
-parser.add_argument(
-    "--lr",
-    "--learning-rate",
-    default=5e-5,
-    type=float,
-    metavar="LR",
-    help="initial learning rate",
-    dest="lr",
-)
-parser.add_argument("--momentum", default=0.9, type=float, metavar="M", help="momentum")
-parser.add_argument(
-    "--wd",
-    "--weight-decay",
-    default=1e-4,
-    type=float,
-    metavar="W",
-    help="weight decay (default: 1e-4)",
-    dest="weight_decay",
-)
-parser.add_argument(
-    "-p",
-    "--print-freq",
-    default=1,
-    type=int,
-    metavar="N",
-    help="print frequency (default: 10)",
-)
-parser.add_argument(
-    "--dist-backend",
-    default="nccl",
-    choices=["nccl", "gloo"],
-    type=str,
-    help="distributed backend",
-)
-parser.add_argument(
-    "--checkpoint-file",
-    default="/shared-efs/checkpoint.pth.tar",
-    type=str,
-    help="checkpoint file path, to load and save to",
-)
-parser.add_argument(
-    "--optimizer",
-    default="AdamW",
-    type=str,
-    help="optimizer type",
-)
-
-
-def main():
-
-    args = parser.parse_args()
-    device_id = int(os.environ["LOCAL_RANK"])
+    if local_rank == 0:
+        wandb.init(config=args, project=args.wandb_project)
+        args = wandb.config
+        do_log = True
+    else:
+        
+        do_log = False
     
-    torch.cuda.set_device(device_id)
-    print(f"=> set cuda device = {device_id}")
+    device_id = local_rank
 
-    dist.init_process_group(
-        backend=args.dist_backend, init_method="env://", timeout=timedelta(seconds=120)
-    )
+    torch.cuda.set_device(device_id)
+    logging.info(f"Set cuda device = {device_id}")
+
+    dist.init_process_group(backend=args.dist_backend, init_method="env://", timeout=timedelta(seconds=120))
 
     model, criterion, optimizer = initialize_huggingface_model(
         args.arch, args.lr, args.momentum, args.weight_decay, args.optimizer, device_id
     )
 
-    train_loader, test_loader = initialize_custom_data_loader(
-        args.data, args.batch_size, args.workers
-    )
-    
+    train_loader, val_loader = initialize_custom_data_loader(args.data, args.batch_size, args.workers)
+
     # resume from checkpoint if one exists;
-    state = load_checkpoint(
-        args.checkpoint_file, device_id, args.arch, model, optimizer
-    )
+    state = load_checkpoint(args.checkpoint_file, device_id, args.arch, model, optimizer)
 
-    start_epoch = state.epoch + 1
-    print(f"=> start_epoch: {start_epoch}, best_acc1: {state.best_acc1}")
+    model_saver = SaveBestModel(args.checkpoint_file, do_log=do_log)
 
-    #convergence_df = pd.DataFrame(columns = ['Epochs','Train_Loss','Validation_Loss'])
+    # for most transformer based models Linear LR decays is best (1/10 total decay)
+    scheduler = LinearLR(optimizer, start_factor=1., end_factor=0.1, total_iters=args.epochs)
 
-    training_start_time = time.time()
+    # start_epoch = state.epoch + 1
 
     print_freq = args.print_freq
-    for epoch in range(start_epoch, args.epochs):
+
+    for epoch in range(args.epochs):
         state.epoch = epoch
         train_loader.batch_sampler.sampler.set_epoch(epoch)
-        #adjust_learning_rate(optimizer, epoch, args.lr)
 
-        # train for one epoch
-        epoch_start_time = time.time()
-        print('Starting Training Epoch')
-        train_loss_epoch = train(train_loader, model, criterion, optimizer, epoch, device_id, print_freq)
-        print('Epoch finished, took {:.2f}s'.format(time.time() - epoch_start_time))
+        logging.info(f"training epoch {epoch}")
+        train_loss_epoch = train(train_loader, model, criterion, optimizer, epoch, device_id, print_freq, do_log)
+        scheduler.step()
 
-        # evaluate on validation set
-        # val_start_time = time.time()
-        # print('Starting Validation')
-        # val_loss_epoch = validate(val_loader, model, criterion, device_id, print_freq)
-        # print('Validation finished, took {:.2f}s'.format(time.time() - val_start_time))
-
-        train_loss = sum(train_loss_epoch)/len(train_loss_epoch)
-        # val_loss = sum(val_loss_epoch)/len(val_loss_epoch)
-        val_loss = 100
-
-        # remember best loss@1 and save checkpoint
-        is_best = val_loss < state.best_acc1
-        state.best_acc1 = min(val_loss, state.best_acc1)
-
-        # convergence_df.loc[epoch,'Epochs'] = epoch
-        # convergence_df.loc[epoch,'Train_Loss'] = train_loss
-        # convergence_df.loc[epoch,'Validation_Loss'] = val_loss
-
+        logging.info(f"validating epoch {epoch}")
+        val_loss_epoch = validate(val_loader, model, criterion, device_id, print_freq, do_log)
 
         if device_id == 0:
-            save_checkpoint(state, is_best, args.checkpoint_file)
-            # convergence_df.to_csv('/shared-efs/arxiv/convergence_df.csv')
+            model_saver.save(state, val_loss_epoch)
 
-    print('Training finished, took {:.2f}s'.format(time.time() - training_start_time))
-       
-    run_predictions(args.checkpoint_file, args.lr,args.optimizer)
-    
+        # if device_id == 0:
+        #     save_checkpoint(state, is_best, args.checkpoint_file)
 
-    
+    logging.info(f"Running predictions")
+    run_predictions(args.checkpoint_file, args.lr, args.optimizer, do_log)
+
+    wandb.finish()
+
+
+def main():
+    parser = argparse.ArgumentParser(description="PyTorch Elastic HuggingFace Training")
+
+    # Required paramaters
+    parser.add_argument(
+        "--data",
+        metavar="DIR",
+        default="/shared-efs/wandb-finbert",
+        help="path to dataset",
+    )
+    parser.add_argument(
+        "--wandb_project",
+        default="aws_eks_demo",
+        help="The wandb project name",
+    )
+    parser.add_argument(
+        "--sweep_id",
+        default=None,
+        help="The Sweep id created by wandb",
+    )
+
+    # Other params
+    parser.add_argument("--arch", default="HuggingFace")
+    parser.add_argument("--workers", default=0, type=int, help="number of data loading workers")
+    parser.add_argument("--epochs", default=1, type=int, help="number of total epochs to run")
+    parser.add_argument("--batch-size", default=32, type=int, help="mini-batch size per worker (GPU)")
+    parser.add_argument("--lr", default=1e-4, type=float, help="initial learning rate")
+    parser.add_argument("--momentum", default=0.9, help="momentum")
+    parser.add_argument("--weight-decay", default=1e-4, help="weight decay (default: 1e-4)")
+    parser.add_argument("--print-freq", default=1, type=int, help="print frequency (default: 10)")
+    parser.add_argument(
+        "--dist-backend",
+        default="nccl",
+        choices=["nccl", "gloo"],
+        help="distributed backend",
+    )
+    parser.add_argument(
+        "--checkpoint-file",
+        default="/shared-efs/checkpoint.pth.tar",
+        help="checkpoint file path, to load and save to",
+    )
+    parser.add_argument("--optimizer", default="AdamW", help="optimizer type")
+
+    args = parser.parse_args()
+
+    wandb.require("service")
+    wandb.setup()
+
+    if args.sweep_id is not None:
+        wandb.agent(args.sweep_id, lambda: run(args), project=args.wandb_project)
+    else:
+        run(args=args)
+
 
 class Dataset(torch.utils.data.Dataset):
     #'Characterizes a dataset for PyTorch'
-    def __init__(self, data_dir, file_name ):
-    
+    def __init__(self, data_dir, file_name):
+
         #'Initialization'
         self.data_dir = data_dir
-        self.df = pd.read_csv(data_dir+file_name)
-        
+        self.df = pd.read_csv(Path(data_dir) / file_name)
+
     def __len__(self):
         # 'Denotes the total number of samples'
         return len(self.df)
-        
+
     def __getitem__(self, index):
         #'Generates one sample of data'
         # Select sample
         df = self.df
-        one_line = df['Text'][index]
-        label = df['labels'][index]
-        
-        return (one_line,label)
+        one_line = df["Text"][index]
+        label = df["labels"][index]
 
-def collate_tokenize(data,tokenizer):
+        return (one_line, label)
+
+
+def collate_tokenize(data, tokenizer):
     text_batch = [element[0] for element in data]
     labels = [element[1] for element in data]
-    tokenized_inputs = tokenizer(text_batch, padding='max_length', truncation=True, return_tensors='pt')
-    
-    tokenized_inputs['labels'] = torch.tensor(labels)
-    tokenized_inputs['attention_mask'] = tokenized_inputs['attention_mask']
+    tokenized_inputs = tokenizer(text_batch, padding="max_length", truncation=True, return_tensors="pt")
+
+    tokenized_inputs["labels"] = torch.tensor(labels)
+    tokenized_inputs["attention_mask"] = tokenized_inputs["attention_mask"]
 
     return tokenized_inputs
-    
+
+
 class MyCollator(object):
-    def __init__(self,tokenizer):
+    def __init__(self, tokenizer):
         self.tokenizer = tokenizer
+
     def __call__(self, batch):
         # do something with batch and self.params
-        tokenized_inputs = collate_tokenize(batch,self.tokenizer)
-        
+        tokenized_inputs = collate_tokenize(batch, self.tokenizer)
+
         return tokenized_inputs
 
 
@@ -290,7 +265,6 @@ class State:
         Essentially a ``serialize()`` function, returns the state as an
         object compatible with ``torch.save()``. The following should work
         ::
-
         snapshot = state_0.capture_snapshot()
         state_1.apply_snapshot(snapshot)
         assert state_0 == state_1
@@ -326,79 +300,80 @@ class State:
 
 
 def initialize_huggingface_model(
-    arch: str, lr: float, momentum: float, weight_decay: float, optimizer_type, device_id: int
+    arch: str,
+    lr: float,
+    momentum: float,
+    weight_decay: float,
+    optimizer_type,
+    device_id: int,
 ):
-    print(f"=> creating model: {arch}")
-    
+    logging.info(f"=> creating model: {arch}")
+
     ## Initializing the model
     model = AutoModelForSequenceClassification.from_pretrained("bert-base-cased", num_labels=2)
-    
+
     # For multiprocessing distributed, DistributedDataParallel constructor
     # should always set the single device scope, otherwise,
     # DistributedDataParallel will use all available devices.
-    
+
     model.cuda(device_id)
-    
+
     cudnn.benchmark = True
-    
+
     model = DistributedDataParallel(model, device_ids=[device_id])
-    
+
     # define loss function (criterion) and optimizer
     criterion = nn.CrossEntropyLoss().cuda(device_id)
 
     # initialize optimizer
-    if optimizer_type == 'AdamW':
+    if optimizer_type == "AdamW":
         optimizer = AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
-    if optimizer_type == 'SGD':
+    if optimizer_type == "SGD":
         optimizer = SGD(model.parameters(), lr=lr, momentum=momentum, weight_decay=weight_decay)
 
     return model, criterion, optimizer
 
 
-def initialize_custom_data_loader(
-    data_dir, batch_size, num_data_workers
-) -> Tuple[DataLoader, DataLoader]:
-    
+def initialize_custom_data_loader(data_dir, batch_size, num_data_workers) -> Tuple[DataLoader, DataLoader]:
+
     # Generators
-    train_dataset = Dataset(data_dir, file_name = 'train.csv')
-    print('Train dataset done')
+    train_dataset = Dataset(data_dir, file_name="train.csv")
+    logging.info("Train dataset done")
 
     train_sampler = ElasticDistributedSampler(train_dataset)
-    print('Train sampler done')
-    
+    logging.info("Train sampler done")
+
     model_name = "bert-base-cased"
     tokenizer = AutoTokenizer.from_pretrained(model_name)
 
-    
     my_collator = MyCollator(tokenizer)
-    
+
     train_loader = DataLoader(
-            train_dataset,
-            batch_size=batch_size,
-            num_workers=num_data_workers,
-            pin_memory=True,
-            collate_fn=my_collator,
-            sampler=train_sampler
-        )
-        
-    print('Train loader done')
-    
-    test_dataset = Dataset(data_dir, file_name = 'test.csv')
-    
-    print('Test dataset done')
+        train_dataset,
+        batch_size=batch_size,
+        num_workers=num_data_workers,
+        pin_memory=True,
+        collate_fn=my_collator,
+        sampler=train_sampler,
+    )
+
+    logging.info("Train loader done")
+
+    test_dataset = Dataset(data_dir, file_name="test.csv")
+
+    logging.info("Test dataset done")
 
     test_loader = DataLoader(
         test_dataset,
         batch_size=batch_size,
         num_workers=num_data_workers,
         pin_memory=True,
-        collate_fn=my_collator
+        collate_fn=my_collator,
     )
-    
-    print('Test loader done')
-    
+
+    logging.info("Test loader done")
+
     return train_loader, test_loader
-    
 
 
 def load_checkpoint(
@@ -412,7 +387,6 @@ def load_checkpoint(
     Loads a local checkpoint (if any). Otherwise, checks to see if any of
     the neighbors have a non-zero state. If so, restore the state
     from the rank that has the most up-to-date checkpoint.
-
     .. note:: when your job has access to a globally visible persistent storage
               (e.g. nfs mount, S3) you can simply have all workers load
               from the most recent checkpoint from such storage. Since this
@@ -425,58 +399,11 @@ def load_checkpoint(
     state = State(arch, model, optimizer)
 
     if os.path.isfile(checkpoint_file):
-        print(f"=> loading checkpoint file: {checkpoint_file}")
+        logging.info(f"=> loading checkpoint file: {checkpoint_file}")
         state.load(checkpoint_file, device_id)
-        print(f"=> loaded checkpoint file: {checkpoint_file}")
+        logging.info(f"=> loaded checkpoint file: {checkpoint_file}")
 
-    # logic below is unnecessary when the checkpoint is visible on all nodes!
-    # create a temporary cpu pg to broadcast most up-to-date checkpoint
-    # with tmp_process_group(backend="gloo") as pg:
-    #     rank = dist.get_rank(group=pg)
-
-    #     # get rank that has the largest state.epoch
-    #     epochs = torch.zeros(dist.get_world_size(), dtype=torch.int32)
-    #     epochs[rank] = state.epoch
-    #     dist.all_reduce(epochs, op=dist.ReduceOp.SUM, group=pg)
-    #     t_max_epoch, t_max_rank = torch.max(epochs, dim=0)
-    #     max_epoch = t_max_epoch.item()
-    #     max_rank = t_max_rank.item()
-
-    #     # max_epoch == -1 means no one has checkpointed return base state
-    #     if max_epoch == -1:
-    #         print(f"=> no workers have checkpoints, starting from epoch 0")
-    #         return state
-
-    #     # broadcast the state from max_rank (which has the most up-to-date state)
-    #     # pickle the snapshot, convert it into a byte-blob tensor
-    #     # then broadcast it, unpickle it and apply the snapshot
-    #     print(f"=> using checkpoint from rank: {max_rank}, max_epoch: {max_epoch}")
-
-    #     with io.BytesIO() as f:
-    #         torch.save(state.capture_snapshot(), f)
-    #         raw_blob = numpy.frombuffer(f.getvalue(), dtype=numpy.uint8)
-
-    #     blob_len = torch.tensor(len(raw_blob))
-    #     dist.broadcast(blob_len, src=max_rank, group=pg)
-    #     print(f"=> checkpoint broadcast size is: {blob_len}")
-
-    #     if rank != max_rank:
-    #         blob = torch.zeros(blob_len.item(), dtype=torch.uint8)
-    #     else:
-    #         blob = torch.as_tensor(raw_blob, dtype=torch.uint8)
-
-    #     dist.broadcast(blob, src=max_rank, group=pg)
-    #     print(f"=> done broadcasting checkpoint")
-
-    #     if rank != max_rank:
-    #         with io.BytesIO(blob.numpy()) as f:
-    #             snapshot = torch.load(f)
-    #         state.apply_snapshot(snapshot, device_id)
-
-    #     # wait till everyone has loaded the checkpoint
-    #     dist.barrier(group=pg)
-
-    print(f"=> done restoring from previous checkpoint")
+    logging.info(f"=> done restoring from previous checkpoint")
     return state
 
 
@@ -489,20 +416,58 @@ def tmp_process_group(backend):
         dist.destroy_process_group(cpu_pg)
 
 
-def save_checkpoint(state: State, is_best: bool, filename: str):
-    checkpoint_dir = os.path.dirname(filename)
-    os.makedirs(checkpoint_dir, exist_ok=True)
+class SaveBestModel:
+    "A simple model saver Callback"
 
-    # save to tmp, then commit by moving the file in case the job
-    # gets interrupted while writing the checkpoint
-    #tmp_filename = filename + ".tmp"
-    torch.save(state.capture_snapshot(), filename)
-    #os.rename(tmp_filename, filename)
-    print(f"=> saved checkpoint for epoch {state.epoch} at {filename}")
-    if is_best:
-        best = os.path.join(checkpoint_dir, "model_best.pth.tar")
-        print(f"=> best model found at epoch {state.epoch} saving to {best}")
-        shutil.copyfile(filename, best)
+    def __init__(self, filename, min_metric=True, do_log=True):
+        self.filename = filename
+        self.min_metric = min_metric
+        self.do_log = do_log
+        self.checkpoint_dir = os.path.dirname(filename)
+        os.makedirs(self.checkpoint_dir, exist_ok=True)
+        self.best = 100 if min_metric else -1
+
+    def save(self, state, metric_value):
+        torch.save(state.capture_snapshot(), self.filename)
+        op = operator.lt if self.min_metric else operator.gt
+        if op(metric_value, self.best):
+            logging.info(f"=> best model found at epoch {state.epoch}")
+            self._save()
+
+    def _save(self):
+        best_model = os.path.join(self.checkpoint_dir, "model_best.pth.tar")
+        shutil.copyfile(self.filename, best_model)
+        if self.do_log:
+             self.log_model(best_model)
+
+    def log_model(self, path, metadata={}, description="trained model"):
+        "Log model file"
+        if wandb.run is None:
+            raise ValueError("You must call wandb.init() before log_model()")
+        path = Path(path)
+        if not path.is_file():
+            raise f"path must be a valid file: {path}"
+        name = f"run-{wandb.run.id}-model"
+        artifact_model = wandb.Artifact(name=name, type="model", metadata=metadata, description=description)
+        with artifact_model.new_file(name, mode="wb") as fa:
+            fa.write(path.read_bytes())
+        wandb.run.log_artifact(artifact_model)
+
+
+# def save_checkpoint(state: State, is_best: bool, filename: str):
+#     checkpoint_dir = os.path.dirname(filename)
+#     os.makedirs(checkpoint_dir, exist_ok=True)
+
+#     # save to tmp, then commit by moving the file in case the job
+#     # gets interrupted while writing the checkpoint
+#     #tmp_filename = filename + ".tmp"
+#     torch.save(state.capture_snapshot(), filename)
+#     #os.rename(tmp_filename, filename)
+#     print(f"=> saved checkpoint for epoch {state.epoch} at {filename}")
+#     if is_best:
+#         best = os.path.join(checkpoint_dir, "model_best.pth.tar")
+#         print(f"=> best model found at epoch {state.epoch} saving to {best}")
+#         shutil.copyfile(filename, best)
 
 
 def train(
@@ -512,74 +477,35 @@ def train(
     optimizer,  # AdamW,
     epoch: int,
     device_id: int,
-    print_freq: int
+    print_freq: int,
+    do_log: bool,
 ):
-    batch_time = AverageMeter("Time", ":6.3f")
-    data_time = AverageMeter("Data", ":6.3f")
     losses = AverageMeter("Loss", ":.4e")
-    #top1 = AverageMeter("Acc@1", ":6.2f")
-    #top5 = AverageMeter("Acc@5", ":6.2f")
-    progress = ProgressMeter(
-        len(train_loader),
-        [batch_time, data_time, losses],
-        prefix="Epoch: [{}]".format(epoch),
-    )
-    
-    print('Length of train_loader = ' + str(len(train_loader)))
 
-    # switch to train mode
     model.train()
-    
 
+    for batch in tqdm(train_loader, total=len(train_loader)):
 
-    end = time.time()
-    train_loss_epoch = []
-    i = 0
-    for (idx,batch) in enumerate(train_loader):
-        #print(i)
-        # measure data loading time
-        data_time.update(time.time() - end)
-
-        
         optimizer.zero_grad()
-        input_ids = batch['input_ids'].cuda(device_id, non_blocking=True)
-        attention_mask = batch['attention_mask'].cuda(device_id, non_blocking=True)
-        labels = batch['labels'].cuda(device_id, non_blocking=True)
-        
-        #print('Len of input_ids  = ' + str(len(input_ids)))
-        
-        
-         # compute output
-        outputs = model(input_ids, attention_mask=attention_mask,labels = labels)
-        
-        #print('Output done')
-        
-        loss = outputs[0]
-        train_loss_epoch.append(loss.item())
+        input_ids = batch["input_ids"].cuda(device_id, non_blocking=True)
+        attention_mask = batch["attention_mask"].cuda(device_id, non_blocking=True)
+        labels = batch["labels"].cuda(device_id, non_blocking=True)
+
+        # forward pass
+        outputs = model(input_ids, attention_mask=attention_mask, labels=labels)
+
+        # hf models return loss as 1st argument
+        loss = outputs.loss
+        if do_log:
+            wandb.log({"train_loss": loss.item()})
 
         # # measure accuracy and record loss
-        losses.update(loss.item(),input_ids.size(0))
-        # acc1, acc5 = accuracy(output, target, topk=(1, 5))
-        # losses.update(loss.item(), images.size(0))
-        # top1.update(acc1[0], images.size(0))
-        # top5.update(acc5[0], images.size(0))
+        losses.update(loss.item(), input_ids.size(0))
 
-        # compute gradient and do SGD step
-        
         loss.backward()
         optimizer.step()
 
-        # measure elapsed time
-        batch_time.update(time.time() - end)
-        end = time.time()
-
-        if i % print_freq == 0:
-            progress.display(i)
-        i = i + 1
-
-    return train_loss_epoch
-
-        
+    return losses.avg
 
 
 def validate(
@@ -588,63 +514,45 @@ def validate(
     criterion,  # nn.CrossEntropyLoss
     device_id: int,
     print_freq: int,
+    do_log: bool,
 ):
-    batch_time = AverageMeter("Time", ":6.3f")
     losses = AverageMeter("Loss", ":.4e")
-    #top1 = AverageMeter("Acc@1", ":6.2f")
-    #top5 = AverageMeter("Acc@5", ":6.2f")
-    # progress = ProgressMeter(
-    #     len(val_loader), [batch_time, losses, top1, top5], prefix="Test: "
-    # )
-    progress = ProgressMeter(
-        len(val_loader), [batch_time, losses], prefix="Test: "
-    )
+
+    metrics = [Metric("val_recall", recall_score), 
+               Metric("val_f1",f1_score),
+               Metric("val_accuracy", accuracy_score),
+               Metric("val_precision", precision_score)]
 
     # switch to evaluate mode
     model.eval()
 
+    with torch.inference_mode():
+        for batch in tqdm(val_loader, total=len(val_loader)):
 
-    with torch.no_grad():
-        end = time.time()
+            input_ids = batch["input_ids"].cuda(device_id, non_blocking=True)
+            attention_mask = batch["attention_mask"].cuda(device_id, non_blocking=True)
+            labels = batch["labels"].cuda(device_id, non_blocking=True)
 
-        val_loss_epoch = []
-        i = 0
-        for (idx,batch) in enumerate(val_loader):
-        
-            if device_id is not None:
-                input_ids = batch['input_ids'].cuda(device_id, non_blocking=True)
-
-            attention_mask = batch['attention_mask'].cuda(device_id, non_blocking=True)
-            labels = batch['labels'].cuda(device_id, non_blocking=True)
-            
-            outputs = model(input_ids, attention_mask=attention_mask, labels = labels)
+            outputs = model(input_ids, attention_mask=attention_mask, labels=labels)
 
             # compute output
             loss = outputs[0]
-            val_loss_epoch.append(loss.item())
 
             # # measure accuracy and record loss
-            losses.update(loss.item(),input_ids.size(0))
-            # acc1, acc5 = accuracy(output, target, topk=(1, 5))
-            # losses.update(loss.item(), images.size(0))
-            # top1.update(acc1[0], images.size(0))
-            # top5.update(acc5[0], images.size(0))
+            losses.update(loss.item(), input_ids.size(0))
 
-            # measure elapsed time
-            batch_time.update(time.time() - end)
-            end = time.time()
+            #compute metrics
+            pred_labels = outputs.logits.argmax(axis=1).cpu()
+            true_labels = labels.cpu()
+            
+            for m in metrics:
+                m.update(pred_labels, true_labels)
 
-            # if i % print_freq == 0:
-            #     progress.display(i)
-            i = i + 1
+        if do_log:
+            wandb.log({"val_loss": losses.avg})
+            wandb.log({m.name:m.avg for m in metrics})
 
-        # TODO: this should also be done with the ProgressMeter
-        #print("Loss = %.3f" % loss.item())
-        # print(
-        #     " * Acc@1 {top1.avg:.3f} Acc@5 {top5.avg:.3f}".format(top1=top1, top5=top5)
-        # )
-
-    return val_loss_epoch
+    return losses.avg
 
 
 class AverageMeter(object):
@@ -671,31 +579,15 @@ class AverageMeter(object):
         fmtstr = "{name} {val" + self.fmt + "} ({avg" + self.fmt + "})"
         return fmtstr.format(**self.__dict__)
 
+class Metric(AverageMeter):
 
-class ProgressMeter(object):
-    def __init__(self, num_batches: int, meters: List[AverageMeter], prefix: str = ""):
-        self.batch_fmtstr = self._get_batch_fmtstr(num_batches)
-        self.meters = meters
-        self.prefix = prefix
-
-    def display(self, batch: int) -> None:
-        entries = [self.prefix + self.batch_fmtstr.format(batch)]
-        entries += [str(meter) for meter in self.meters]
-        print("\t".join(entries))
-
-    def _get_batch_fmtstr(self, num_batches: int) -> str:
-        num_digits = len(str(num_batches // 1))
-        fmt = "{:" + str(num_digits) + "d}"
-        return "[" + fmt + "/" + fmt.format(num_batches) + "]"
-
-
-def adjust_learning_rate(optimizer, epoch: int, lr: float) -> None:
-    """
-    Sets the learning rate to the initial LR decayed by 10 every 30 epochs
-    """
-    learning_rate = lr * (0.1 ** (epoch // 30))
-    for param_group in optimizer.param_groups:
-        param_group["lr"] = learning_rate
+    def __init__(self, name, func):
+        super().__init__(name)
+        self.func = func
+    
+    def update(self, y_pred, y_true):
+        val = self.func(y_pred=y_pred, y_true=y_true)
+        super().update(val)
 
 
 # def accuracy(output, target, topk=(1,)):
@@ -716,71 +608,85 @@ def adjust_learning_rate(optimizer, epoch: int, lr: float) -> None:
 #             res.append(correct_k.mul_(100.0 / batch_size))
 #         return res
 
-def run_predictions(
-    checkpoint_filename,
-    lr,
-    optimizer
-):
-    
+
+def run_predictions(checkpoint_filename, lr, optimizer, do_log):
+    print("**********************\nRunning predictions\n**********************")
     checkpoint_dir = os.path.dirname(checkpoint_filename)
-    print('*****************')
-    print(checkpoint_dir)
-    
-    model = AutoModelForSequenceClassification.from_pretrained("bert-base-cased", num_labels=2)
+    logging.info(checkpoint_dir)
+
     device = torch.device("cuda")
-    checkpoint = torch.load(checkpoint_dir+"/checkpoint.tar", map_location=str(device))
-    state_dict = checkpoint['state_dict']
+    model_name = "bert-base-cased"
+    test_file = "/shared-efs/wandb-finbert/test.csv"
+
+    model = AutoModelForSequenceClassification.from_pretrained(model_name, num_labels=2)
+    
+    checkpoint = torch.load(checkpoint_dir + "/checkpoint.pth.tar")
+    state_dict = checkpoint["state_dict"]
     # create new OrderedDict that does not contain `module.`
 
+    logging.info("Doing some state dict magic")
     new_state_dict = OrderedDict()
     for k, v in state_dict.items():
-        #name = k[7:] # remove `module.`
-        name = k.replace('module.', '') # removing ‘moldule.’ from key
+        # name = k[7:] # remove `module.`
+        name = k.replace("module.", "")  # removing ‘moldule.’ from key
         new_state_dict[name] = v
     # load params
     model.load_state_dict(new_state_dict)
-    model.eval()
-    
-    model_name = "bert-base-cased"
+
     tokenizer = AutoTokenizer.from_pretrained(model_name)
-    
-    test_df = pd.read_csv('/shared-efs/wandb-finbert/test.csv')
-    
-    tokenized_test_inputs = tokenizer(list(test_df['Text']), padding='max_length', truncation=True, return_tensors='pt')
-    
-    # tokenized_test_inputs.to(device)
-    # model.to(device)
-    
+
+    test_df = pd.read_csv(test_file)
+
+    logging.info("Tokening inputs")
+    tokenized_test_inputs = tokenizer(
+        list(test_df["Text"]),
+        padding="max_length",
+        truncation=True,
+        return_tensors="pt",
+    )
+
+    tokenized_test_inputs.to(device)
+    model.to(device)
+    logging.info(f"Running inference on: {device}")
+
+    model.eval()
     with torch.no_grad():
         preds = model(**tokenized_test_inputs)
-        
-    pred_labels = preds[0].argmax(axis = 1).tolist()
-    true_labels = list(test_df['labels'])
-    
-    recall = recall_score(y_pred=pred_labels,y_true = true_labels)
-    f1 = f1_score(y_pred=pred_labels,y_true = true_labels)
-    accuracy = accuracy_score(y_pred=pred_labels,y_true = true_labels)
-    precision = precision_score(y_pred=pred_labels,y_true = true_labels)
-    
-    pred_dict = {'recall': recall,
-    'f1': f1,
-    'accuracy': accuracy,
-    'precision': precision}
-    
+
+    pred_labels = preds.logits.argmax(axis=1).tolist()
+    true_labels = list(test_df["labels"])
+
+    recall = recall_score(y_pred=pred_labels, y_true=true_labels)
+    f1 = f1_score(y_pred=pred_labels, y_true=true_labels)
+    accuracy = accuracy_score(y_pred=pred_labels, y_true=true_labels)
+    precision = precision_score(y_pred=pred_labels, y_true=true_labels)
+
+    pred_dict = {
+        "test_recall": recall,
+        "test_f1": f1,
+        "test_accuracy": accuracy,
+        "test_precision": precision,
+    }
+
+    if do_log:
+        wandb.log(pred_dict)
+
     metrics_df = pd.DataFrame()
     metrics_df = metrics_df.append(pred_dict, ignore_index=True)
-    
-    run_name = checkpoint_dir.split('/')[-1]
-    metrics_df['run_name'] = run_name
-    metrics_df['lr'] = lr
-    metrics_df['optimizer'] = optimizer
-    
-    
-    if os.path.exists('/shared-efs/wandb-finbert/all_results.csv'):
-        metrics_df.to_csv('/shared-efs/wandb-finbert/all_results.csv', mode='a', index=False, header=False)
+
+    run_name = checkpoint_dir.split("/")[-1]
+    metrics_df["run_name"] = run_name
+    metrics_df["lr"] = lr
+    metrics_df["optimizer"] = optimizer
+
+    out_file = "all_results.csv"
+
+    logging.info(f"Logging metrics to : {out_file}")
+    if os.path.exists(f"/shared-efs/wandb-finbert/{out_file}"):
+        metrics_df.to_csv(f"/shared-efs/wandb-finbert/{out_file}", mode="a", index=False, header=False)
     else:
-        metrics_df.to_csv('/shared-efs/wandb-finbert/all_results.csv', index=False)
-    
+        metrics_df.to_csv(f"/shared-efs/wandb-finbert/{out_file}", index=False)
+
     return None
 
 
